@@ -1,0 +1,542 @@
+# Ethan's Hybrid Model (Content-Based + Collaborative Filtering)
+# Student ID: 2411369
+
+
+
+
+import pandas as pd
+import numpy as np
+import json
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from surprise import SVD, Dataset, Reader
+from surprise.model_selection import train_test_split
+from sklearn.metrics import precision_score, recall_score, f1_score
+import os  # For file checks
+import difflib  # For fuzzy matching game titles
+import time  # For timing
+import gc  # For garbage collection
+
+
+# Define the dataset folder (please change path)
+dataset_folder = r'C:\Users\Ethan\OneDrive\Desktop\ai\SteamGame'
+
+
+# Check if files exist in the folder
+files_to_check = ['recommendations.csv', 'games.csv', 'games_metadata.json']
+for file in files_to_check:
+    file_path = os.path.join(dataset_folder, file)
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Missing file: {file_path}. Ensure the dataset is unzipped into '{dataset_folder}' and files are named correctly. Download from https://www.kaggle.com/datasets/antonkozyriev/game-recommendations-on-steam.")
+
+
+# Load games data first
+games = pd.read_csv(os.path.join(dataset_folder, 'games.csv'))
+
+
+# Helper: robust title matching (case-insensitive + fuzzy + substring)
+def match_title_get_app_id(query_title: str, titles_series: pd.Series, cutoff: float = 0.6):
+    import re
+    
+    # Normalize: lowercase + remove punctuation
+    def normalize(text):
+        text = str(text).strip().lower()
+        # Remove common punctuation but keep spaces
+        text = re.sub(r'[:\-™®©\'"\.,!?]', '', text)
+        # Normalize multiple spaces to single space
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+    
+    # Check if title is non-game content
+    def is_non_game_content(title):
+        title_upper = str(title).upper()
+        non_game_keywords = ['DLC', 'SOUNDTRACK', 'OST', 'MUSIC', 'SOUND TRACK', 
+                            'CONTENT PACK', 'COSMETIC', 'SEASON PASS', 'ARTBOOK', 
+                            'ART BOOK', 'DIGITAL ART', 'WALLPAPER', 'AVATAR']
+        return any(keyword in title_upper for keyword in non_game_keywords)
+    
+    q = normalize(query_title)
+    titles_lower = titles_series.fillna('').astype(str).str.strip().str.lower()
+    titles_normalized = titles_lower.apply(normalize)
+
+    # Exact normalized match first - prioritize games over non-game content
+    exact_matches = titles_normalized[titles_normalized == q].index
+    for idx in exact_matches:
+        title = games.loc[idx, 'title']
+        if not is_non_game_content(title):
+            return games.loc[idx, 'app_id'], title
+    # If only non-game content matches, return first
+    if len(exact_matches) > 0:
+        return games.loc[exact_matches[0], 'app_id'], games.loc[exact_matches[0], 'title']
+
+    # Substring match on normalized - prioritize games
+    contains_matches = titles_normalized[titles_normalized.str.contains(re.escape(q), regex=True, na=False)].index
+    for idx in contains_matches:
+        title = games.loc[idx, 'title']
+        if not is_non_game_content(title):
+            return games.loc[idx, 'app_id'], title
+    # If only non-game content matches, return first
+    if len(contains_matches) > 0:
+        return games.loc[contains_matches[0], 'app_id'], games.loc[contains_matches[0], 'title']
+
+    # Fuzzy match on normalized titles - prioritize games
+    matches = difflib.get_close_matches(q, titles_normalized.tolist(), n=5, cutoff=cutoff)
+    for matched_normalized in matches:
+        idx = titles_normalized[titles_normalized == matched_normalized].index
+        if len(idx) > 0:
+            title = games.loc[idx[0], 'title']
+            if not is_non_game_content(title):
+                return games.loc[idx[0], 'app_id'], title
+    # If only non-game content matches, return first
+    if matches:
+        matched_normalized = matches[0]
+        idx = titles_normalized[titles_normalized == matched_normalized].index
+        if len(idx) > 0:
+            return games.loc[idx[0], 'app_id'], games.loc[idx[0], 'title']
+    return None, None
+
+
+# Get sample size from user
+print("\n" + "="*60)
+print("Sample Size Configuration")
+print("="*60)
+print("WARNING: Running large sample sizes may crash your system!")
+print("Optimal size: 100,000 - 5,000,000 rows")
+print("="*60)
+
+
+while True:
+    try:
+        sample_size_input = input("\nEnter sample size (e.g., 100000, 500000, 1000000): ").strip()
+        sample_size = int(sample_size_input.replace(",", ""))  # Allow comma-separated input
+       
+        if sample_size < 10000:
+            print("Sample size too small. Minimum is 10,000.")
+            continue
+        elif sample_size > 10000000:
+            print(f"WARNING: You entered {sample_size:,} rows. This is very large and may crash your system!")
+            confirm = input("Are you sure you want to continue? (y/n): ").strip().lower()
+            if confirm != 'y':
+                continue
+        elif sample_size > 5000000:
+            print(f"You entered {sample_size:,} rows. This is larger than the optimal range.")
+            confirm = input("Are you sure you want to continue? (y/n): ").strip().lower()
+            if confirm != 'y':
+                continue
+       
+        print(f"\nUsing sample size: {sample_size:,} rows")
+        confirm = input("Confirm? (y/n): ").strip().lower()
+        if confirm == 'y':
+            break
+        else:
+            continue
+    except ValueError:
+        print("Invalid input. Please enter a number.")
+        continue
+
+
+# Get DLC filter preference from user
+print("\n" + "="*60)
+print("Content Filter Configuration")
+print("="*60)
+while True:
+    dlc_filter_input = input("Do you want to exclude DLC, soundtracks, and non-game content? (y/n): ").strip().lower()
+    if dlc_filter_input in ['y', 'yes']:
+        exclude_dlc = True
+        print("Non-game content (DLC, soundtracks, etc.) will be excluded from recommendations.")
+        break
+    elif dlc_filter_input in ['n', 'no']:
+        exclude_dlc = False
+        print("All content types will be included in recommendations.")
+        break
+    else:
+        print("Invalid input. Please enter 'y' or 'n'.")
+
+
+# Get hybrid weight preference from user
+print("\n" + "="*60)
+print("Hybrid Model Weight Configuration")
+print("="*60)
+print("Adjust the balance between collaborative and content-based filtering:")
+print("  0.0 = Pure content-based filtering")
+print("  0.5 = Equal weight (recommended)")
+print("  1.0 = Pure collaborative filtering")
+print("="*60)
+
+while True:
+    try:
+        collab_weight_input = input("\nEnter collaborative filtering weight (0.0 - 1.0, default 0.5): ").strip()
+        if collab_weight_input == '':
+            collab_weight = 0.5
+        else:
+            collab_weight = float(collab_weight_input)
+        
+        if 0.0 <= collab_weight <= 1.0:
+            content_weight = 1.0 - collab_weight
+            print(f"Using weights: Collaborative={collab_weight:.2f}, Content-based={content_weight:.2f}")
+            break
+        else:
+            print("Please enter a value between 0.0 and 1.0")
+    except ValueError:
+        print("Invalid input. Please enter a number between 0.0 and 1.0")
+
+
+# Load recommendations data efficiently with chunking
+print("\nLoading recommendations data...")
+file_path = os.path.join(dataset_folder, 'recommendations.csv')
+chunk_size = 100000
+chunks = []
+rows_loaded = 0
+load_start = time.time()
+
+
+# Load chunks until we reach the user-specified sample size
+for chunk in pd.read_csv(file_path, chunksize=chunk_size, low_memory=False):
+    chunks.append(chunk)
+    rows_loaded += len(chunk)
+    print(f"  Loaded {rows_loaded:,} rows...")
+    if rows_loaded >= sample_size:
+        break
+
+
+print(f"Combining {len(chunks)} chunks...")
+all_recommendations = pd.concat(chunks, ignore_index=True)
+load_time = time.time() - load_start
+print(f"Loaded {len(all_recommendations):,} rows in {load_time:.2f}s")
+
+
+# Use user-specified sample size
+recommendations = all_recommendations.head(sample_size)
+del all_recommendations, chunks
+gc.collect()
+print(f"Using {len(recommendations):,} recommendations for training")
+
+# Validate minimum data requirements
+if len(recommendations) < 1000:
+    raise ValueError(f"Insufficient data loaded. Only {len(recommendations):,} rows available. Please increase sample size or check data file.")
+
+unique_users = recommendations['user_id'].nunique()
+unique_games = recommendations['app_id'].nunique()
+print(f"Dataset contains {unique_users:,} unique users and {unique_games:,} unique games")
+
+if unique_games < 10:
+    raise ValueError(f"Insufficient game variety. Only {unique_games} unique games found. Please increase sample size.")
+
+
+# Derive ratings using BOTH is_recommended AND hours played
+print("\nCalculating ratings...")
+game_avg_hours = recommendations.groupby('app_id')['hours'].transform('mean')
+recommendations['relative_hours'] = recommendations['hours'] / (game_avg_hours + 1)
+percentiles = recommendations['relative_hours'].quantile([0.33, 0.66])
+
+
+def calculate_rating(row):
+    is_rec = str(row['is_recommended']).lower() == 'true'
+    rel_hours = row['relative_hours']
+   
+    if is_rec:
+        if rel_hours <= percentiles[0.33]:
+            return 3
+        elif rel_hours <= percentiles[0.66]:
+            return 4
+        else:
+            return 5
+    else:
+        if rel_hours <= percentiles[0.33]:
+            return 1
+        elif rel_hours <= percentiles[0.66]:
+            return 2
+        else:
+            return 3
+
+
+print("Calculating ratings based on is_recommended + relative playtime...")
+recommendations['rating'] = recommendations.apply(calculate_rating, axis=1)
+print(f"Rating distribution:\n{recommendations['rating'].value_counts().sort_index()}")
+
+
+# Normalize ratings per user
+print("\nNormalizing user ratings (removing bias)...")
+user_means = recommendations.groupby('user_id')['rating'].transform('mean')
+recommendations['normalized_rating'] = recommendations['rating'] - user_means + 3.0
+print("Rating normalization complete")
+
+
+# Train collaborative filtering model (SVD)
+print("\nPreparing dataset for collaborative filtering...")
+ratings = recommendations[['user_id', 'app_id', 'normalized_rating']].copy()
+ratings.columns = ['user_id', 'app_id', 'rating']
+reader = Reader(rating_scale=(1, 5))
+data = Dataset.load_from_df(ratings, reader)
+
+print("Splitting into train/test (80/20)...")
+trainset, testset = train_test_split(data, test_size=0.2, random_state=42)
+
+print("\nTraining SVD model for collaborative filtering...")
+train_start = time.time()
+svd_model = SVD(n_factors=100, n_epochs=30, lr_all=0.01, reg_all=0.1, random_state=42)
+svd_model.fit(trainset)
+train_time = time.time() - train_start
+print(f"SVD model trained in {train_time:.2f}s")
+
+
+# Load game metadata for content-based filtering
+print("\nLoading game metadata for content-based filtering...")
+metadata_path = os.path.join(dataset_folder, 'games_metadata.json')
+metadata_list = []
+load_start = time.time()
+
+with open(metadata_path, 'r', encoding='utf-8') as f:
+    for line in f:
+        try:
+            game_data = json.loads(line.strip())
+            metadata_list.append(game_data)
+        except json.JSONDecodeError:
+            continue
+
+metadata_df = pd.DataFrame(metadata_list)
+load_time = time.time() - load_start
+print(f"Loaded {len(metadata_df):,} game metadata entries in {load_time:.2f}s")
+
+# Merge metadata with games data
+games_with_metadata = games.merge(metadata_df, on='app_id', how='left')
+games_with_metadata['tags'] = games_with_metadata['tags'].apply(lambda x: ' '.join(x) if isinstance(x, list) else '')
+games_with_metadata['description'] = games_with_metadata['description'].fillna('')
+games_with_metadata['content'] = games_with_metadata['tags'] + ' ' + games_with_metadata['description']
+
+print(f"Merged metadata with {len(games_with_metadata):,} games")
+
+
+# Build TF-IDF matrix for content-based filtering
+print("\nBuilding TF-IDF matrix...")
+tfidf_start = time.time()
+tfidf = TfidfVectorizer(
+    max_features=5000,
+    stop_words='english',
+    ngram_range=(1, 2),
+    min_df=2
+)
+
+games_with_content = games_with_metadata[games_with_metadata['content'].str.len() > 0].copy()
+tfidf_matrix = tfidf.fit_transform(games_with_content['content'])
+tfidf_time = time.time() - tfidf_start
+
+print(f"TF-IDF matrix built in {tfidf_time:.2f}s")
+print(f"Matrix shape: {tfidf_matrix.shape} (games x features)")
+
+
+# Evaluate hybrid model
+print("\nEvaluating hybrid model...")
+preds = []
+actuals = []
+
+for u, i, r in testset[:10000]:  # Evaluate on subset for speed
+    # Collaborative filtering score
+    collab_pred = svd_model.predict(u, i).est
+    
+    # Content-based score (if available)
+    game_idx = games_with_content[games_with_content['app_id'] == i].index
+    
+    if len(game_idx) > 0:
+        # Get user's highly rated games
+        user_games = recommendations[
+            (recommendations['user_id'] == u) & 
+            (recommendations['rating'] >= 4)
+        ]['app_id'].values
+        
+        user_game_indices = games_with_content[games_with_content['app_id'].isin(user_games)].index
+        
+        if len(user_game_indices) > 0:
+            game_idx = game_idx[0]
+            similarities = cosine_similarity(
+                tfidf_matrix[game_idx:game_idx+1],
+                tfidf_matrix[user_game_indices]
+            )[0]
+            avg_similarity = np.mean(similarities)
+            content_pred = 1 + (avg_similarity * 4)
+        else:
+            content_pred = 3.0  # Neutral if no user history
+    else:
+        content_pred = 3.0  # Neutral if no content data
+    
+    # Combine predictions with weights
+    hybrid_pred = (collab_weight * collab_pred) + (content_weight * content_pred)
+    
+    preds.append(hybrid_pred)
+    actuals.append(r)
+
+# Calculate metrics
+rmse = np.sqrt(np.mean((np.array(preds) - np.array(actuals)) ** 2))
+mae = np.mean(np.abs(np.array(preds) - np.array(actuals)))
+
+classification_threshold = 3
+pred_binary = [1 if p >= classification_threshold else 0 for p in preds]
+actual_binary = [1 if a >= classification_threshold else 0 for a in actuals]
+
+precision = precision_score(actual_binary, pred_binary, zero_division=0)
+recall = recall_score(actual_binary, pred_binary, zero_division=0)
+f1 = f1_score(actual_binary, pred_binary, zero_division=0)
+
+print(f'Regression Metrics:')
+print(f'  RMSE: {rmse:.4f}')
+print(f'  MAE: {mae:.4f}')
+print(f'\nClassification Metrics (threshold >= {classification_threshold}):')
+print(f'  Precision: {precision:.4f} ({precision*100:.2f}%)')
+print(f'  Recall: {recall:.4f} ({recall*100:.2f}%)')
+print(f'  F1 Score: {f1:.4f} ({f1*100:.2f}%)')
+print(f'\n✓ Hybrid model is ready for recommendations!')
+
+
+# Hybrid recommendation function
+def get_hybrid_recommendations(app_id, top_n=5, exclude_dlc=False):
+    try:
+        # Collaborative filtering recommendations
+        users_who_played = recommendations[recommendations['app_id'] == app_id]['user_id'].unique()
+        
+        collab_scores = {}
+        collab_data_available = False
+        
+        if len(users_who_played) > 0:
+            other_games = recommendations[recommendations['user_id'].isin(users_who_played)]
+            other_games = other_games[other_games['app_id'] != app_id]
+            
+            if len(other_games) > 0:
+                game_stats = other_games.groupby('app_id').agg({
+                    'user_id': 'count',
+                    'rating': 'mean'
+                }).reset_index()
+                game_stats.columns = ['app_id', 'co_play_count', 'avg_rating']
+                game_stats['collab_score'] = game_stats['co_play_count'] * game_stats['avg_rating']
+                
+                # Check if we have meaningful collaborative data
+                if len(game_stats) >= 3 and game_stats['co_play_count'].max() >= 2:
+                    collab_data_available = True
+                    
+                    # Normalize collaborative scores to 0-1 range
+                    max_collab = game_stats['collab_score'].max()
+                    if max_collab > 0:
+                        game_stats['collab_score'] = game_stats['collab_score'] / max_collab
+                    
+                    collab_scores = dict(zip(game_stats['app_id'], game_stats['collab_score']))
+        
+        # Content-based filtering recommendations
+        content_scores = {}
+        content_data_available = False
+        game_data = games_with_content[games_with_content['app_id'] == app_id]
+        
+        if not game_data.empty:
+            game_idx = game_data.index[0]
+            
+            # Check if game has meaningful content
+            game_vector = tfidf_matrix[game_idx:game_idx+1].toarray()[0]
+            non_zero_features = np.count_nonzero(game_vector)
+            
+            if non_zero_features >= 3:
+                similarity_scores = cosine_similarity(
+                    tfidf_matrix[game_idx:game_idx+1],
+                    tfidf_matrix
+                )[0]
+                
+                # Check if similarities are meaningful
+                non_self_similarities = similarity_scores[similarity_scores < 0.9999]  # Exclude self
+                if len(non_self_similarities) > 0 and non_self_similarities.max() > 0.01:
+                    content_data_available = True
+                    
+                    for idx, score in enumerate(similarity_scores):
+                        game_id = games_with_content.iloc[idx]['app_id']
+                        if game_id != app_id:
+                            content_scores[game_id] = score
+        
+        # Check if we have sufficient data from at least one source
+        if not collab_data_available and not content_data_available:
+            return "INSUFFICIENT_DATA"
+        
+        # Combine scores
+        all_game_ids = set(collab_scores.keys()) | set(content_scores.keys())
+        
+        if not all_game_ids:
+            return "INSUFFICIENT_DATA"  # No recommendations available
+        
+        hybrid_scores = {}
+        
+        for game_id in all_game_ids:
+            collab_score = collab_scores.get(game_id, 0.0)
+            content_score = content_scores.get(game_id, 0.0)
+            hybrid_scores[game_id] = (collab_weight * collab_score) + (content_weight * content_score)
+        
+        if not hybrid_scores:
+            return None
+        
+        # Sort by hybrid score
+        sorted_games = sorted(hybrid_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # Get top N titles (with DLC filter)
+        rec_titles = []
+        for game_id, score in sorted_games[:min(top_n*3, len(sorted_games))]:
+            title_match = games[games['app_id'] == game_id]['title']
+            
+            if not title_match.empty:
+                title = title_match.values[0]
+                # Filter out DLC and non-game content if requested
+                if exclude_dlc:
+                    title_upper = title.upper()
+                    non_game_keywords = ['DLC', 'SOUNDTRACK', 'OST', 'MUSIC', 'SOUND TRACK', 
+                                        'CONTENT PACK', 'COSMETIC', 'SEASON PASS', 'ARTBOOK', 
+                                        'ART BOOK', 'DIGITAL ART', 'WALLPAPER']
+                    if any(keyword in title_upper for keyword in non_game_keywords):
+                        continue
+                rec_titles.append(title)
+                if len(rec_titles) >= top_n:
+                    break
+        
+        return rec_titles if len(rec_titles) > 0 else []
+    except Exception as e:
+        print(f"Error generating recommendations: {str(e)}")
+        return []
+
+
+# Interactive loop for recommendations
+print("\n" + "="*60)
+print("Game Recommendation System - Hybrid Model")
+print("="*60)
+print(f"Model weights: Collaborative={collab_weight:.2f}, Content-based={content_weight:.2f}")
+if exclude_dlc:
+    print("Content Filter: ON (Non-game content will be excluded from recommendations)")
+else:
+    print("Content Filter: OFF (All content types will be included)")
+print("Type 'quit' or 'exit' to stop the program\n")
+
+
+while True:
+    favorite_game = input("Enter a game you like (or 'quit' to exit): ").strip()
+   
+    # Check if user wants to exit
+    if favorite_game.lower() in ['quit', 'exit', 'q']:
+        print("\nThank you for using the Game Recommendation System. Goodbye!")
+        break
+   
+    # Skip empty input
+    if not favorite_game:
+        print("Please enter a game name.\n")
+        continue
+   
+    # Find closest matching title (robust match)
+    app_id, matched_title = match_title_get_app_id(favorite_game, games['title'], cutoff=0.6)
+    if app_id is not None:
+        print(f"Found match: {matched_title} (app_id={app_id})")
+        recommendations_list = get_hybrid_recommendations(app_id, top_n=5, exclude_dlc=exclude_dlc)
+        if recommendations_list == "INSUFFICIENT_DATA":
+            print(f"Sorry, '{matched_title}' does not have sufficient sampling data for reliable recommendations.")
+            print("This game has insufficient user interaction data or metadata. Try increasing the sample size or choose another game.")
+        elif recommendations_list is None:
+            print(f"Sorry, '{matched_title}' was not found in the current sampling size or does not have enough data. Try increasing the sample size or try another game.")
+        elif recommendations_list and len(recommendations_list) > 0:
+            print("Here are 5 recommended games based on the hybrid model (collaborative + content-based):")
+            for rec in recommendations_list:
+                print(f"- {rec}")
+        else:
+            print(f"Sorry, '{matched_title}' does not have enough data in the current sampling size. Try increasing the sample size or try another game.")
+    else:
+        print(f"Sorry, '{favorite_game}' was not found in the dataset. Please try another game.")
+   
+    print()  # Add blank line for readability
